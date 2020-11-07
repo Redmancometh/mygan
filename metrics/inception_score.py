@@ -8,7 +8,6 @@
 
 import numpy as np
 import tensorflow as tf
-import tflex
 import dnnlib.tflib as tflib
 
 from metrics import metric_base
@@ -25,13 +24,13 @@ class IS(metric_base.MetricBase):
 
     def _evaluate(self, Gs, Gs_kwargs, num_gpus):
         minibatch_size = num_gpus * self.minibatch_per_gpu
-        inception = misc.load_pkl('https://drive.google.com/uc?id=1Mz9zQnIrusm3duZB91ng_aUIePFNI6Jx', 'inception_v3_softmax.pkl')
+        inception = misc.load_pkl('https://nvlabs-fi-cdn.nvidia.com/stylegan/networks/metrics/inception_v3_softmax.pkl')
         activations = np.empty([self.num_images, inception.output_shape[1]], dtype=np.float32)
 
         # Construct TensorFlow graph.
         result_expr = []
         for gpu_idx in range(num_gpus):
-            with tflex.device('/gpu:%d' % gpu_idx):
+            with tf.device('/gpu:%d' % gpu_idx):
                 Gs_clone = Gs.clone()
                 inception_clone = inception.clone()
                 latents = tf.random_normal([self.minibatch_per_gpu] + Gs_clone.input_shape[1:])

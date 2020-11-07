@@ -6,9 +6,9 @@
 
 """Helper wrapper for a Tensorflow optimizer."""
 
+import platform
 import numpy as np
 import tensorflow as tf
-import tflex
 
 from collections import OrderedDict
 from typing import List, Union
@@ -19,58 +19,9 @@ from .. import util
 
 from .tfutil import TfExpression, TfExpressionEx
 
-try:
-    # TensorFlow 1.13
-    from tensorflow.python.ops import nccl_ops
-except:
-    # Older TensorFlow versions
-    import tensorflow.contrib.nccl as nccl_ops
-
-from tensorflow.python.framework import ops as tf_ops
-
-def all_sum_plain(g, colocate=False, *args, **kws):
-  r = []
-  for i in range(len(g)):
-    if colocate:
-      with tf_ops.colocate_with(g[i]):
-        r.append(tf.add_n(g))
-    else:
-      r.append(tf.add_n(g))
-  return r
-
-try:
-    # TensorFlow 1.13
-    from tensorflow.python.ops import nccl_ops
-except:
-    # Older TensorFlow versions
-    import tensorflow.contrib.nccl as nccl_ops
-
-def all_sum_gpu(g, *args, **kws):
-  return nccl_ops.all_sum(g, *args, **kws)
-
-from tensorflow.python.tpu.ops import tpu_ops
-
-#def all_sum_tpu(g, *args, **kws):
-#  g = tpu_ops.cross_replica_sum(g, *args, **kws)
-#  return [g[i] for i in range(shape_list(g)[0])]
-
-def all_sum_tpu(g, colocate=True, *args, **kws):
-  #import pdb
-  #pdb.set_trace()
-  #r = tf.reduce_sum(g)
-  #r = tf.reduce_sum(tf.stack(g), axis=0, keepdims=True)
-  #r = tpu_ops.cross_replica_sum(g, *args, **kws)
-  #r = [r[i] for i in range(shape_list(r)[0])]
-  return all_sum_plain(g, colocate=colocate, *args, **kws)
-
-def all_sum(cores, g, colocate=True, *args, **kws):
-  if any([':TPU:' in x for x in cores.keys()]):
-    return all_sum_tpu(g, colocate=colocate, *args, **kws)
-  elif any([':GPU:' in x for x in cores.keys()]):
-    return all_sum_gpu(g, *args, **kws)
-  else:
-    return all_sum_cpu(g, *args, **kws)
-
+_collective_ops_warning_printed = False
+_collective_ops_group_key       = 831766147
+_collective_ops_instance_key    = 436340067
 
 class Optimizer:
     """A Wrapper for tf.train.Optimizer.
@@ -95,7 +46,6 @@ class Optimizer:
         loss_scaling_inc:       float           = 0.0005,                   # Log2 of per-minibatch loss scaling increment when there is no overflow.
         loss_scaling_dec:       float           = 1.0,                      # Log2 of per-minibatch loss scaling decrement when there is an overflow.
         report_mem_usage:       bool            = False,                    # Report fine-grained memory usage statistics in TensorBoard?
-        cross_shard:            bool            = False,                    # Use CrossShardOptimizer?
         **kwargs):
 
         # Public fields.
@@ -117,7 +67,6 @@ class Optimizer:
         self._shared_optimizers     = OrderedDict() # device_name => optimizer_class
         self._gradient_shapes       = None          # [shape, ...]
         self._report_mem_usage      = report_mem_usage
-        self._cross_shard           = cross_shard
 
         # Validate arguments.
         assert callable(self.optimizer_class)
@@ -148,13 +97,10 @@ class Optimizer:
         device.grad_acc         = OrderedDict() # Accumulated gradients:    var => grad
 
         # Setup TensorFlow objects.
-        with tfutil.absolute_name_scope(self.scope + "/Devices"), tflex.device(device_name), tf.control_dependencies(None):
+        with tfutil.absolute_name_scope(self.scope + "/Devices"), tf.device(device_name), tf.control_dependencies(None):
             if device_name not in self._shared_optimizers:
                 optimizer_name = self.scope.replace("/", "_") + "_opt%d" % len(self._shared_optimizers)
                 self._shared_optimizers[device_name] = self.optimizer_class(name=optimizer_name, learning_rate=self.learning_rate, **self.optimizer_kwargs)
-                if self._cross_shard or 'TPU_REPLICATED_CORE' in device_name:
-                    print('Using cross-shard optimizer for %s' % device_name)
-                    self._shared_optimizers[device_name] = tf.contrib.tpu.CrossShardOptimizer(self._shared_optimizers[device_name])
             device.optimizer = self._shared_optimizers[device_name]
             if self.use_loss_scaling:
                 device.loss_scaling_var = tf.Variable(np.float32(self.loss_scaling_init), trainable=False, name="loss_scaling_var")
@@ -188,13 +134,13 @@ class Optimizer:
         if self._report_mem_usage:
             self._report_mem_usage = False
             try:
-                with tf.name_scope(self.id + '_mem'), tflex.device(device.name), tf.control_dependencies([loss]):
+                with tf.name_scope(self.id + '_mem'), tf.device(device.name), tf.control_dependencies([loss]):
                     deps.append(autosummary.autosummary(self.id + "/mem_usage_gb", tf.contrib.memory_stats.BytesInUse() / 2**30))
             except tf.errors.NotFoundError:
                 pass
 
         # Compute gradients.
-        with tf.name_scope(self.id + "_grad"), tflex.device(device.name), tf.control_dependencies(deps):
+        with tf.name_scope(self.id + "_grad"), tf.device(device.name), tf.control_dependencies(deps):
             loss = self.apply_loss_scaling(tf.cast(loss, tf.float32))
             gate = tf.train.Optimizer.GATE_NONE  # disable gating to reduce memory usage
             grad_list = device.optimizer.compute_gradients(loss=loss, var_list=trainable_vars, gate_gradients=gate)
@@ -219,7 +165,7 @@ class Optimizer:
 
         # Clean up gradients.
         for device_idx, device in enumerate(self._devices.values()):
-            with tfutil.absolute_name_scope(self.scope + "/Clean%d" % device_idx), tflex.device(device.name):
+            with tfutil.absolute_name_scope(self.scope + "/Clean%d" % device_idx), tf.device(device.name):
                 for var, grad in device.grad_raw.items():
 
                     # Filter out disconnected gradients and convert to float32.
@@ -244,17 +190,17 @@ class Optimizer:
 
         # Sum gradients across devices.
         if len(self._devices) > 1:
-            with tfutil.absolute_name_scope(self.scope + "/Broadcast"), tflex.device(None):
-                for all_vars in zip(*[device.grad_clean.keys() for device in self._devices.values()]):
-                    if len(all_vars) > 0 and all(dim > 0 for dim in all_vars[0].shape.as_list()): # NCCL does not support zero-sized tensors.
-                        all_grads = [device.grad_clean[var] for device, var in zip(self._devices.values(), all_vars)]
-                        all_grads = all_sum(self._devices, all_grads)
-                        for device, var, grad in zip(self._devices.values(), all_vars, all_grads):
-                            device.grad_clean[var] = grad
+            with tfutil.absolute_name_scope(self.scope + "/Broadcast"), tf.device(None):
+                if platform.system() == "Windows":    # Windows => NCCL ops are not available.
+                    self._broadcast_fallback()
+                elif tf.VERSION.startswith("1.15."):  # TF 1.15 => NCCL ops are broken: https://github.com/tensorflow/tensorflow/issues/41539
+                    self._broadcast_fallback()
+                else:                                 # Otherwise => NCCL ops are safe to use.
+                    self._broadcast_nccl()
 
         # Apply updates separately on each device.
         for device_idx, device in enumerate(self._devices.values()):
-            with tfutil.absolute_name_scope(self.scope + "/Apply%d" % device_idx), tflex.device(device.name):
+            with tfutil.absolute_name_scope(self.scope + "/Apply%d" % device_idx), tf.device(device.name):
                 # pylint: disable=cell-var-from-loop
 
                 # Accumulate gradients over time.
@@ -299,22 +245,21 @@ class Optimizer:
 
                 # Last device => report statistics.
                 if device_idx == len(self._devices) - 1:
-                    all_ops.append(autosummary.autosummary(self.id + "/learning_rate", self.learning_rate))
+                    all_ops.append(autosummary.autosummary(self.id + "/learning_rate", tf.convert_to_tensor(self.learning_rate)))
                     all_ops.append(autosummary.autosummary(self.id + "/overflow_frequency", tf.where(all_ok, 0, 1), condition=acc_ok))
                     if self.use_loss_scaling:
                         all_ops.append(autosummary.autosummary(self.id + "/loss_scaling_log2", device.loss_scaling_var))
 
-        def finalize():
-            # Initialize variables.
-            self.reset_optimizer_state()
-            if self.use_loss_scaling:
-                tfutil.init_uninitialized_vars([device.loss_scaling_var for device in self._devices.values()])
-            if self.minibatch_multiplier is not None:
-                tfutil.run([var.initializer for device in self._devices.values() for var in list(device.grad_acc_vars.values()) + [device.grad_acc_count]])
+        # Initialize variables.
+        self.reset_optimizer_state()
+        if self.use_loss_scaling:
+            tfutil.init_uninitialized_vars([device.loss_scaling_var for device in self._devices.values()])
+        if self.minibatch_multiplier is not None:
+            tfutil.run([var.initializer for device in self._devices.values() for var in list(device.grad_acc_vars.values()) + [device.grad_acc_count]])
 
         # Group everything into a single op.
         with tfutil.absolute_name_scope(self.scope):
-            return tf.group(*all_ops, name="TrainingOp"), finalize
+            return tf.group(*all_ops, name="TrainingOp")
 
     def reset_optimizer_state(self) -> None:
         """Reset internal state of the underlying optimizer."""
@@ -338,6 +283,42 @@ class Optimizer:
         if not self.use_loss_scaling:
             return value
         return value * tfutil.exp2(-self.get_loss_scaling_var(value.device)) # pylint: disable=invalid-unary-operand-type
+
+    def _broadcast_nccl(self):
+        """Sum gradients across devices using NCCL ops (fast path)."""
+        from tensorflow.python.ops import nccl_ops # pylint: disable=no-name-in-module
+        for all_vars in zip(*[device.grad_clean.keys() for device in self._devices.values()]):
+            if any(x.shape.num_elements() > 0 for x in all_vars):
+                all_grads = [device.grad_clean[var] for device, var in zip(self._devices.values(), all_vars)]
+                all_grads = nccl_ops.all_sum(all_grads)
+                for device, var, grad in zip(self._devices.values(), all_vars, all_grads):
+                    device.grad_clean[var] = grad
+
+    def _broadcast_fallback(self):
+        """Sum gradients across devices using TensorFlow collective ops (slow fallback path)."""
+        from tensorflow.python.ops import collective_ops # pylint: disable=no-name-in-module
+        global _collective_ops_warning_printed, _collective_ops_group_key, _collective_ops_instance_key
+        if all(x.shape.num_elements() == 0 for device in self._devices.values() for x in device.grad_clean.values()):
+            return
+        if not _collective_ops_warning_printed:
+            print("------------------------------------------------------------------------")
+            print("WARNING: Using slow fallback implementation for inter-GPU communication.")
+            print("Please use TensorFlow 1.14 on Linux for optimal training performance.")
+            print("------------------------------------------------------------------------")
+            _collective_ops_warning_printed = True
+        for device in self._devices.values():
+            with tf.device(device.name):
+                combo = [tf.reshape(x, [x.shape.num_elements()]) for x in device.grad_clean.values()]
+                combo = tf.concat(combo, axis=0)
+                combo = collective_ops.all_reduce(combo, merge_op='Add', final_op='Id',
+                    group_size=len(self._devices), group_key=_collective_ops_group_key,
+                    instance_key=_collective_ops_instance_key)
+                cur_ofs = 0
+                for var, grad_old in device.grad_clean.items():
+                    grad_new = tf.reshape(combo[cur_ofs : cur_ofs + grad_old.shape.num_elements()], grad_old.shape)
+                    cur_ofs += grad_old.shape.num_elements()
+                    device.grad_clean[var] = grad_new
+        _collective_ops_instance_key += 1
 
 
 class SimpleAdam:

@@ -8,7 +8,6 @@
 
 import numpy as np
 import tensorflow as tf
-import tflex
 import dnnlib.tflib as tflib
 
 from metrics import metric_base
@@ -53,7 +52,7 @@ class PPL(metric_base.MetricBase):
         # Construct TensorFlow graph.
         distance_expr = []
         for gpu_idx in range(num_gpus):
-            with tflex.device('/gpu:%d' % gpu_idx):
+            with tf.device('/gpu:%d' % gpu_idx):
                 Gs_clone = Gs.clone()
                 noise_vars = [var for name, var in Gs_clone.components.synthesis.vars.items() if name.startswith('noise')]
 
@@ -98,7 +97,7 @@ class PPL(metric_base.MetricBase):
 
                 # Evaluate perceptual distance.
                 img_e0, img_e1 = images[0::2], images[1::2]
-                distance_measure = misc.load_pkl('https://drive.google.com/uc?id=1N2-m9qszOeVC9Tq77WxsLnuWwOedQiD2', 'vgg16_zhang_perceptual.pkl')
+                distance_measure = misc.load_pkl('https://nvlabs-fi-cdn.nvidia.com/stylegan/networks/metrics/vgg16_zhang_perceptual.pkl')
                 distance_expr.append(distance_measure.get_output_for(img_e0, img_e1) * (1 / self.epsilon**2))
 
         # Sampling loop.

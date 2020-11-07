@@ -13,9 +13,6 @@ import uuid
 import sys
 import numpy as np
 import tensorflow as tf
-import tflex
-import threading
-tflex.network_lock = threading.RLock()
 
 from collections import OrderedDict
 from typing import Any, List, Tuple, Union
@@ -73,7 +70,7 @@ class Network:
         var_global_to_local: Mapping from variable global names to local names.
     """
 
-    def __init__(self, name: str = None, scope: str = None, func_name: Any = None, reset_own_vars = False, **static_kwargs):
+    def __init__(self, name: str = None, func_name: Any = None, **static_kwargs):
         tfutil.assert_tf_initialized()
         assert isinstance(name, str) or name is None
         assert func_name is not None
@@ -82,7 +79,6 @@ class Network:
 
         self._init_fields()
         self.name = name
-        self.scope = scope
         self.static_kwargs = util.EasyDict(static_kwargs)
 
         # Locate the user-specified network build function.
@@ -99,16 +95,7 @@ class Network:
 
         # Init TensorFlow graph.
         self._init_graph()
-        if reset_own_vars:
-            self.ensure()
-
-    def ensure(self):
-        for k, v in self.components.items():
-            v.ensure()
-        if self._need_reset:
-            self.reset_own_vars()
-            self._need_reset = False
-        return self
+        self.reset_own_vars()
 
     def _init_fields(self) -> None:
         self.name = None
@@ -134,13 +121,8 @@ class Network:
         self._build_func_name = None  # Name of the build function.
         self._build_module_src = None  # Full source code of the module containing the build function.
         self._run_cache = dict()  # Cached graph data for Network.run().
-        self._need_reset = True
 
     def _init_graph(self) -> None:
-        with tflex.network_lock:
-            self._init_graph_()
-
-    def _init_graph_(self) -> None:
         # Collect inputs.
         self.input_names = []
 
@@ -155,9 +137,8 @@ class Network:
         if self.name is None:
             self.name = self._build_func_name
         assert re.match("^[A-Za-z0-9_.\\-]*$", self.name)
-        if self.scope is None:
-            with tf.name_scope(None):
-                self.scope = tf.get_default_graph().unique_name(self.name, mark_as_used=True)
+        with tf.name_scope(None):
+            self.scope = tf.get_default_graph().unique_name(self.name, mark_as_used=True)
 
         # Finalize build func kwargs.
         build_kwargs = dict(self.static_kwargs)
@@ -319,12 +300,6 @@ class Network:
 
     def clone(self, name: str = None, **new_static_kwargs) -> "Network":
         """Create a clone of this network with its own copy of the variables."""
-        net, finalize = self.clone2(name, **new_static_kwargs)
-        finalize()
-        return net
-
-    def clone2(self, name: str = None, **new_static_kwargs) -> ("Network", Any):
-        """Create a clone of this network with its own copy of the variables."""
         # pylint: disable=protected-access
         net = object.__new__(Network)
         net._init_fields()
@@ -335,27 +310,23 @@ class Network:
         net._build_func_name = self._build_func_name
         net._build_func = self._build_func
         net._init_graph()
-        def finalize():
-            with tflex.network_lock:
-                self.ensure()
-                net.ensure()
-                net.copy_vars_from(self)
-        return net, finalize
+        net.copy_vars_from(self)
+        return net
 
     def copy_own_vars_from(self, src_net: "Network") -> None:
         """Copy the values of all variables from the given network, excluding sub-networks."""
         names = [name for name in self.own_vars.keys() if name in src_net.own_vars]
-        tfutil.set_vars({self.vars[name]: src_net.vars[name] for name in names})
+        tfutil.set_vars(tfutil.run({self.vars[name]: src_net.vars[name] for name in names}))
 
     def copy_vars_from(self, src_net: "Network") -> None:
         """Copy the values of all variables from the given network, including sub-networks."""
         names = [name for name in self.vars.keys() if name in src_net.vars]
-        tfutil.set_vars({self.vars[name]: src_net.vars[name] for name in names})
+        tfutil.set_vars(tfutil.run({self.vars[name]: src_net.vars[name] for name in names}))
 
     def copy_trainables_from(self, src_net: "Network") -> None:
         """Copy the values of all trainable variables from the given network, including sub-networks."""
         names = [name for name in self.trainables.keys() if name in src_net.trainables]
-        tfutil.set_vars({self.vars[name]: src_net.vars[name] for name in names})
+        tfutil.set_vars(tfutil.run({self.vars[name]: src_net.vars[name] for name in names}))
 
     def convert(self, new_func_name: str, new_name: str = None, **new_static_kwargs) -> "Network":
         """Create new network with the given parameters, and copy all variables from this network."""
@@ -427,13 +398,13 @@ class Network:
         # Build graph.
         if key not in self._run_cache:
             with tfutil.absolute_name_scope(self.scope + "/_Run"), tf.control_dependencies(None):
-                with tflex.device("/cpu:0"):
+                with tf.device("/cpu:0"):
                     in_expr = [tf.placeholder(tf.float32, name=name) for name in self.input_names]
                     in_split = list(zip(*[tf.split(x, num_gpus) for x in in_expr]))
 
                 out_split = []
                 for gpu in range(num_gpus):
-                    with tflex.device("/gpu:%d" % gpu):
+                    with tf.device("/gpu:%d" % gpu):
                         net_gpu = self.clone() if assume_frozen else self
                         in_gpu = in_split[gpu]
 
@@ -453,7 +424,7 @@ class Network:
                         assert len(out_gpu) == self.num_outputs
                         out_split.append(out_gpu)
 
-                with tflex.device("/cpu:0"):
+                with tf.device("/cpu:0"):
                     out_expr = [tf.concat(outputs, axis=0) for outputs in zip(*out_split)]
                     self._run_cache[key] = in_expr, out_expr
 
@@ -566,7 +537,7 @@ class Network:
         if title is None:
             title = self.name
 
-        with tf.name_scope(None), tflex.device(None), tf.control_dependencies(None):
+        with tf.name_scope(None), tf.device(None), tf.control_dependencies(None):
             for local_name, var in self.trainables.items():
                 if "/" in local_name:
                     p = local_name.split("/")
