@@ -498,14 +498,18 @@ def create_celeba(tfrecord_dir, celeba_dir, cx=89, cy=121):
             tfr.add_image(img)
 
 #----------------------------------------------------------------------------
-
-def create_from_images(tfrecord_dir, image_dir, shuffle):
+def create_from_images(tfrecord_dir, image_dir, shuffle, res_log2=7, resize=None, max_images=None):
     print('Loading images from "%s"' % image_dir)
     image_filenames = sorted(glob.glob(os.path.join(image_dir, '*')))
+    if max_images is None:
+            max_images = len(image_filenames)
+    print(f"detected {len(image_filenames)} images ...")
     if len(image_filenames) == 0:
         error('No input images found')
-
-    img = np.asarray(PIL.Image.open(image_filenames[0]))
+    if resize == None:
+        img = np.asarray(PIL.Image.open(image_filenames[0]).convert('RGB'))
+    else:
+        img = np.asarray(PIL.Image.open(image_filenames[0]).convert('RGB').resize((resize, resize), PIL.Image.ANTIALIAS))
     resolution = img.shape[0]
     channels = img.shape[2] if img.ndim == 3 else 1
     if img.shape[1] != resolution:
@@ -515,15 +519,23 @@ def create_from_images(tfrecord_dir, image_dir, shuffle):
     if channels not in [1, 3]:
         error('Input images must be stored as RGB or grayscale')
 
-    with TFRecordExporter(tfrecord_dir, len(image_filenames)) as tfr:
+    with TFRecordExporter(tfrecord_dir, max_images) as tfr:
         order = tfr.choose_shuffled_order() if shuffle else np.arange(len(image_filenames))
+        print("Adding the images to tfrecords ...")
         for idx in range(order.size):
-            img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
+            if idx % 10000 == 0:
+                print ("added images", idx)
+            if resize == None:
+                img = np.asarray(PIL.Image.open(image_filenames[order[idx]]).convert('RGB'))
+            else:
+                img = np.asarray(PIL.Image.open(image_filenames[order[idx]]).convert('RGB').resize((resize, resize), PIL.Image.ANTIALIAS))
             if channels == 1:
                 img = img[np.newaxis, :, :] # HW => CHW
             else:
                 img = img.transpose([2, 0, 1]) # HWC => CHW
             tfr.add_image(img)
+            if tfr.cur_images == max_images:
+                break
 
 #----------------------------------------------------------------------------
 
@@ -624,6 +636,9 @@ def execute_cmdline(argv):
     p.add_argument(     'tfrecord_dir',     help='New dataset directory to be created')
     p.add_argument(     'image_dir',        help='Directory containing the images')
     p.add_argument(     '--shuffle',        help='Randomize image order (default: 1)', type=int, default=1)
+    p.add_argument(     '--resize',         help="width/height of the image (default: None)", type=int, default=None, required=False)
+    p.add_argument(     '--res_log2',       help="image width and height should be multiple of 2**res_log2 (default: 7)", type=int, default=7)
+    p.add_argument(     '--max_images',     help='Maximum number of images (default: none)', type=int, default=None)
 
     p = add_command(    'create_from_hdf5', 'Create dataset from legacy HDF5 archive.',
                                             'create_from_hdf5 datasets/celebahq ~/downloads/celeba-hq-1024x1024.h5')

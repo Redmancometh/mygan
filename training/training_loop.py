@@ -125,10 +125,10 @@ def training_loop(
     mirror_augment          = False,    # Enable mirror augment?
     drange_net              = [-1,1],   # Dynamic range used when feeding image data to the networks.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = only save 'reals.png' and 'fakes-init.png'.
-    network_snapshot_ticks  = 1,       # How often to save network snapshots? None = only save 'networks-final.pkl'.
+    network_snapshot_ticks  = 2,       # How often to save network snapshots? None = only save 'networks-final.pkl'.
     save_tf_graph           = False,    # Include full TensorFlow computation graph in the tfevents file?
     save_weight_histograms  = False,    # Include weight histograms in the tfevents file?
-    resume_pkl              = "/content/drive/My Drive/mine.pkl",     # Network pickle to resume training from, None = train from scratch.
+    resume_pkl              = "trainingresults/snapshot.pkl",     # Network pickle to resume training from, None = train from scratch.
     resume_kimg             = 0.0,      # Assumed training progress at the beginning. Affects reporting and training schedule.
     resume_time             = 0.0,      # Assumed wallclock time at the beginning. Affects reporting.
     resume_with_new_nets    = False):   # Construct new networks according to G_args and D_args before resuming training?
@@ -332,10 +332,10 @@ def training_loop(
             autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
 
             # Save snapshots.
-            if image_snapshot_ticks is not None and (cur_tick % image_snapshot_ticks == 0 or done):
+            if image_snapshot_ticks is not None:
                 grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=sched.minibatch_gpu)
                 misc.save_image_grid(grid_fakes, dnnlib.make_run_dir_path('fakes%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
-            if network_snapshot_ticks is not None and (cur_tick % network_snapshot_ticks == 0 or done):
+            if network_snapshot_ticks is not None:
                 pkl = dnnlib.make_run_dir_path('network-snapshot-%06d.pkl' % (cur_nimg // 1000))
                 misc.save_pkl((G, D, Gs), pkl)
                 metrics.run(pkl, run_dir=dnnlib.make_run_dir_path(), data_dir=dnnlib.convert_path(data_dir), num_gpus=num_gpus, tf_config=tf_config)
